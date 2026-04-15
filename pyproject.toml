@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-ollama-agent"
+version = "0.1.0"
+description = "Hermes-inspired local agent runtime for Ollama"
+requires-python = ">=3.11"
+dependencies = [
+    "agent-framework>=1.0.0a0",
+]
+
+[project.scripts]
+hermes-ollama = "hermes_ollama_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

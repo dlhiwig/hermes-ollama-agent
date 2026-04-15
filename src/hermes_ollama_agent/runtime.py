@@ -1,0 +1,449 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass
+from typing import Any
+
+from .config import HermesConfig
+from .memory import MemoryStore
+from .prompts import build_system_prompt, build_user_turn
+from .skills import SkillLibrary
+
+ROLE_INSTRUCTIONS: dict[str, str] = {
+    "researcher": (
+        "You are a research specialist. Surface facts, assumptions, and unknowns. "
+        "Prioritize constraints, dependencies, and risk flags."
+    ),
+    "coder": (
+        "You are an implementation specialist. Convert the task into concrete code changes, "
+        "interfaces, test cases, and validation steps."
+    ),
+    "reviewer": (
+        "You are a quality and risk specialist. Challenge weak assumptions, identify regressions, "
+        "and define verification criteria."
+    ),
+    "generalist": (
+        "You are a pragmatic generalist agent. Deliver a focused execution response and explicit next actions."
+    ),
+}
+
+ROLE_TOOL_POLICY: dict[str, set[str]] = {
+    "default": {
+        "list_skills",
+        "read_skill",
+        "search_skills",
+        "read_memory_snapshot",
+        "add_memory",
+        "add_user_preference",
+    },
+    "planner": {"list_skills", "search_skills", "read_memory_snapshot"},
+    "researcher": {"list_skills", "read_skill", "search_skills", "read_memory_snapshot"},
+    "coder": {"list_skills", "read_skill", "search_skills", "read_memory_snapshot", "add_memory"},
+    "reviewer": {"list_skills", "read_skill", "search_skills", "read_memory_snapshot"},
+    "synthesizer": {"list_skills", "read_memory_snapshot"},
+    "generalist": {"list_skills", "read_skill", "search_skills", "read_memory_snapshot"},
+}
+
+TOOL_ORDER: list[str] = [
+    "list_skills",
+    "read_skill",
+    "search_skills",
+    "read_memory_snapshot",
+    "add_memory",
+    "add_user_preference",
+]
+
+
+@dataclass(slots=True)
+class DelegationSubtask:
+    subtask_id: int
+    role: str
+    task: str
+
+
+@dataclass(slots=True)
+class DelegationPlan:
+    objective: str
+    subtasks: list[DelegationSubtask]
+
+
+@dataclass(slots=True)
+class DelegationResult:
+    subtask: DelegationSubtask
+    output: str
+    status: str
+
+
+class HermesRuntime:
+    def __init__(self, config: HermesConfig) -> None:
+        self.config = config
+        self.memory = MemoryStore(
+            root=config.state_dir,
+            memory_char_budget=config.memory_char_budget,
+            user_char_budget=config.user_char_budget,
+            max_turn_chars=config.max_turn_chars,
+        )
+        self.skills = SkillLibrary(config.skills_dir)
+        self._clients: dict[str, Any] = {}
+        self._agent: Any = None
+        self.memory.ensure()
+        self.skills.load()
+
+    def _build_tools(self, allowed_tool_names: set[str]) -> list[Any]:
+        from agent_framework import tool
+
+        @tool(approval_mode="never_require")
+        def list_skills() -> str:
+            """List available skill documents."""
+            return self.skills.list_for_model()
+
+        @tool(approval_mode="never_require")
+        def read_skill(skill_name: str) -> str:
+            """Read one skill markdown file by name."""
+            doc = self.skills.get(skill_name)
+            if doc is None:
+                return f"Skill '{skill_name}' not found."
+            return doc.body
+
+        @tool(approval_mode="never_require")
+        def search_skills(query: str) -> str:
+            """Search skills by simple lexical matching."""
+            docs = self.skills.search(query)
+            if not docs:
+                return "No matching skills found."
+            return "\n".join(f"- {doc.name}: {doc.preview}" for doc in docs)
+
+        @tool(approval_mode="never_require")
+        def read_memory_snapshot() -> str:
+            """Return current memory and user profile context."""
+            return self.memory.context_block()
+
+        @tool(approval_mode="never_require")
+        def add_memory(note: str) -> str:
+            """Persist a durable project memory note."""
+            self.memory.add_memory_note(note)
+            return "Saved note to MEMORY.md"
+
+        @tool(approval_mode="never_require")
+        def add_user_preference(note: str) -> str:
+            """Persist a user preference note."""
+            self.memory.add_user_note(note)
+            return "Saved note to USER.md"
+
+        registry: dict[str, Any] = {
+            "list_skills": list_skills,
+            "read_skill": read_skill,
+            "search_skills": search_skills,
+            "read_memory_snapshot": read_memory_snapshot,
+            "add_memory": add_memory,
+            "add_user_preference": add_user_preference,
+        }
+        return [registry[name] for name in TOOL_ORDER if name in allowed_tool_names]
+
+    @staticmethod
+    def _normalize_role(role: str) -> str:
+        candidate = role.strip().lower()
+        if candidate in ROLE_TOOL_POLICY:
+            return candidate
+        return "generalist"
+
+    def _tool_policy_for_role(self, role: str) -> set[str]:
+        normalized = self._normalize_role(role)
+        return set(ROLE_TOOL_POLICY.get(normalized, ROLE_TOOL_POLICY["generalist"]))
+
+    async def _get_client(self, model_id: str) -> Any:
+        if model_id in self._clients:
+            return self._clients[model_id]
+        from agent_framework.openai import OpenAIChatClient
+
+        client = OpenAIChatClient(
+            base_url=self.config.base_url,
+            api_key=self.config.api_key,
+            model=model_id,
+        )
+        self._clients[model_id] = client
+        return client
+
+    async def _make_agent(
+        self,
+        *,
+        name: str,
+        instructions: str,
+        model_role: str,
+        policy_role: str,
+    ) -> Any:
+        model_id = self.config.model_for_role(model_role)
+        client = await self._get_client(model_id)
+        tools = self._build_tools(self._tool_policy_for_role(policy_role))
+        return client.as_agent(name=name, instructions=instructions, tools=tools)
+
+    async def _ensure_agent(self) -> None:
+        if self._agent is not None:
+            return
+        self._agent = await self._make_agent(
+            name="HermesLocal",
+            instructions=build_system_prompt(self.skills.list_for_model()),
+            model_role="default",
+            policy_role="default",
+        )
+
+    def reload_skills(self) -> None:
+        self.skills.load()
+        self._agent = None
+
+    def describe_routing(self) -> str:
+        models = self.config.model_routing_table()
+        lines = ["Model routing and tool policy:"]
+        for role in [
+            "default",
+            "planner",
+            "researcher",
+            "coder",
+            "reviewer",
+            "synthesizer",
+            "generalist",
+        ]:
+            allowed = ", ".join(sorted(self._tool_policy_for_role(role)))
+            lines.append(f"- {role}: model={models[role]} | tools={allowed}")
+        return "\n".join(lines)
+
+    async def run_turn(self, user_input: str) -> str:
+        await self._ensure_agent()
+        prompt = build_user_turn(user_input=user_input, memory_block=self.memory.context_block())
+        response = await self._agent.run(prompt)
+        text = self._extract_text(response)
+        self.memory.append_turn(user_text=user_input, assistant_text=text)
+        return text
+
+    async def delegate_parallel(self, objective: str, max_workers: int = 3) -> str:
+        bounded_workers = max(1, min(max_workers, 6))
+
+        plan = await self._build_delegation_plan(objective=objective, max_workers=bounded_workers)
+        results = await self._execute_plan(plan=plan, max_workers=bounded_workers)
+        synthesis = await self._synthesize_results(plan=plan, results=results)
+
+        worker_summary = "\n".join(
+            f"{item.subtask.subtask_id}. [{item.subtask.role}] {item.subtask.task}"
+            for item in plan.subtasks
+        )
+        composed = (
+            "Delegation plan:\n"
+            f"{worker_summary}\n\n"
+            "Integrated response:\n"
+            f"{synthesis}"
+        )
+        self.memory.append_turn(
+            user_text=f"[delegated] {objective}",
+            assistant_text=composed,
+        )
+        return composed
+
+    async def _build_delegation_plan(self, objective: str, max_workers: int) -> DelegationPlan:
+        planner_prompt = (
+            "Create a delegation plan in strict JSON.\n"
+            "Return only JSON with this shape:\n"
+            '{\n  "subtasks": [\n    {"role": "researcher|coder|reviewer|generalist", "task": "..." }\n  ]\n}\n\n'
+            f"Constraints:\n- Max subtasks: {max_workers}\n"
+            "- Use concise tasks.\n"
+            "- Keep roles valid.\n\n"
+            f"Objective:\n{objective}\n\n"
+            "Context snapshot:\n"
+            f"{self.memory.context_block()}\n\n"
+            "Skills snapshot:\n"
+            f"{self.skills.list_for_model()}\n"
+        )
+
+        planner_agent = await self._make_agent(
+            name="DelegationPlanner",
+            instructions=(
+                "You are a planning agent that decomposes objectives into parallelizable subtasks. "
+                "Return strict JSON only."
+            ),
+            model_role="planner",
+            policy_role="planner",
+        )
+        raw_plan = self._extract_text(await planner_agent.run(planner_prompt))
+        parsed = self._parse_plan(raw_plan, objective=objective, max_workers=max_workers)
+        if parsed.subtasks:
+            return parsed
+        return self._fallback_plan(objective=objective, max_workers=max_workers)
+
+    async def _execute_plan(self, plan: DelegationPlan, max_workers: int) -> list[DelegationResult]:
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def run_subtask(subtask: DelegationSubtask) -> DelegationResult:
+            async with semaphore:
+                role_instructions = ROLE_INSTRUCTIONS.get(subtask.role, ROLE_INSTRUCTIONS["generalist"])
+                worker_agent = await self._make_agent(
+                    name=f"{subtask.role.title()}Worker{subtask.subtask_id}",
+                    instructions=(
+                        f"{role_instructions}\n"
+                        "You are one worker in a parallel delegation pipeline. "
+                        "Be explicit about assumptions and hand-off details."
+                    ),
+                    model_role=subtask.role,
+                    policy_role=subtask.role,
+                )
+                worker_prompt = (
+                    f"Top-level objective:\n{plan.objective}\n\n"
+                    f"Assigned subtask ({subtask.role}):\n{subtask.task}\n\n"
+                    "Deliver output with headings:\n"
+                    "1) Findings\n2) Proposed Actions\n3) Hand-off Notes\n"
+                )
+                try:
+                    output = self._extract_text(await worker_agent.run(worker_prompt))
+                    return DelegationResult(subtask=subtask, output=output, status="ok")
+                except Exception as exc:  # pragma: no cover - runtime integration path
+                    return DelegationResult(
+                        subtask=subtask,
+                        output=f"Worker execution failed: {exc}",
+                        status="error",
+                    )
+
+        tasks = [run_subtask(item) for item in plan.subtasks]
+        return await asyncio.gather(*tasks)
+
+    async def _synthesize_results(self, plan: DelegationPlan, results: list[DelegationResult]) -> str:
+        synth_agent = await self._make_agent(
+            name="DelegationSynthesizer",
+            instructions=(
+                "You synthesize outputs from parallel workers into one actionable response. "
+                "Resolve conflicts, call out risks, and provide ordered next steps."
+            ),
+            model_role="synthesizer",
+            policy_role="synthesizer",
+        )
+        worker_blocks: list[str] = []
+        for result in results:
+            worker_blocks.append(
+                f"Worker {result.subtask.subtask_id} ({result.subtask.role}, {result.status})\n"
+                f"Task: {result.subtask.task}\n"
+                f"Output:\n{result.output}\n"
+            )
+        prompt = (
+            f"Objective:\n{plan.objective}\n\n"
+            "Worker outputs:\n"
+            f"{'\n'.join(worker_blocks)}\n"
+            "Return one integrated response with these sections:\n"
+            "Summary\nExecution Plan\nRisks\nVerification\n"
+        )
+        return self._extract_text(await synth_agent.run(prompt))
+
+    def _parse_plan(self, raw_plan: str, objective: str, max_workers: int) -> DelegationPlan:
+        payload = self._extract_json(raw_plan)
+        if payload is None:
+            return DelegationPlan(objective=objective, subtasks=[])
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return DelegationPlan(objective=objective, subtasks=[])
+
+        if not isinstance(data, dict):
+            return DelegationPlan(objective=objective, subtasks=[])
+        raw_subtasks = data.get("subtasks")
+        if not isinstance(raw_subtasks, list):
+            return DelegationPlan(objective=objective, subtasks=[])
+
+        subtasks: list[DelegationSubtask] = []
+        for raw_item in raw_subtasks[:max_workers]:
+            if not isinstance(raw_item, dict):
+                continue
+            task = str(raw_item.get("task", "")).strip()
+            if not task:
+                continue
+            role = self._normalize_role(str(raw_item.get("role", "generalist")))
+            if role not in ROLE_INSTRUCTIONS:
+                role = "generalist"
+            subtasks.append(
+                DelegationSubtask(
+                    subtask_id=len(subtasks) + 1,
+                    role=role,
+                    task=task,
+                )
+            )
+
+        return DelegationPlan(objective=objective, subtasks=subtasks)
+
+    @staticmethod
+    def _extract_json(text: str) -> str | None:
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            return stripped
+
+        start = stripped.find("{")
+        while start != -1:
+            depth = 0
+            for index in range(start, len(stripped)):
+                char = stripped[index]
+                if char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return stripped[start : index + 1]
+            start = stripped.find("{", start + 1)
+        return None
+
+    def _fallback_plan(self, objective: str, max_workers: int) -> DelegationPlan:
+        templates = [
+            ("researcher", "Identify constraints, external dependencies, and unknowns for the objective."),
+            ("coder", "Draft the implementation approach and concrete change list."),
+            ("reviewer", "Assess risk, regressions, and verification strategy."),
+        ]
+        subtasks: list[DelegationSubtask] = []
+        for role, task in templates[:max_workers]:
+            subtasks.append(
+                DelegationSubtask(
+                    subtask_id=len(subtasks) + 1,
+                    role=role,
+                    task=f"{task} Objective: {objective}",
+                )
+            )
+        if not subtasks:
+            subtasks.append(
+                DelegationSubtask(
+                    subtask_id=1,
+                    role="generalist",
+                    task=objective,
+                )
+            )
+        return DelegationPlan(objective=objective, subtasks=subtasks)
+
+    def list_skills(self) -> str:
+        return self.skills.list_for_model()
+
+    def read_skill(self, name: str) -> str:
+        doc = self.skills.get(name)
+        if doc is None:
+            return f"Skill '{name}' not found."
+        return doc.body
+
+    def search_skills(self, query: str) -> str:
+        docs = self.skills.search(query)
+        if not docs:
+            return "No matching skills found."
+        return "\n".join(f"- {doc.name}: {doc.preview}" for doc in docs)
+
+    def get_memory(self) -> str:
+        return self.memory.context_block()
+
+    def add_memory(self, note: str) -> None:
+        self.memory.add_memory_note(note)
+
+    def add_user_pref(self, note: str) -> None:
+        self.memory.add_user_note(note)
+
+    @staticmethod
+    def _extract_text(response: Any) -> str:
+        if isinstance(response, str):
+            return response
+        if hasattr(response, "text"):
+            text = getattr(response, "text")
+            if isinstance(text, str) and text.strip():
+                return text
+        if hasattr(response, "output_text"):
+            output_text = getattr(response, "output_text")
+            if isinstance(output_text, str) and output_text.strip():
+                return output_text
+        return str(response)
