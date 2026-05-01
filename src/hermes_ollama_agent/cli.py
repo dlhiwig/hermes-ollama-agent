@@ -23,6 +23,11 @@ HELP_TEXT = """Commands:
   /health                Run health checks
   /status                Show kernel status
   /events                Show recent lifecycle events
+  /runs                  List persisted delegation runs
+  /run <id>              Show one persisted run payload
+  /resume <id>           Resume a non-completed run
+  /abort <id>            Mark a run aborted
+  /retry <id>            Retry failed subtasks from a run
 """
 
 

@@ -94,6 +94,7 @@ class HermesRuntime:
         self.memory.ensure()
         self.skills.load()
         self._runs_dir.mkdir(parents=True, exist_ok=True)
+        self._aborted_runs: set[str] = set()
 
     def _build_tools(self, allowed_tool_names: set[str]) -> list[Any]:
         from agent_framework import tool
@@ -227,8 +228,12 @@ class HermesRuntime:
 
         plan = await self._build_delegation_plan(objective=objective, max_workers=bounded_workers)
         self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": "running", "plan": [asdict(s) for s in plan.subtasks], "results": []})
+        if active_run_id in self._aborted_runs:
+            self._aborted_runs.remove(active_run_id)
         results = await self._execute_plan(plan=plan, max_workers=bounded_workers)
-        self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": "completed", "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results]})
+        has_errors = any(item.status != "ok" for item in results)
+        status = "aborted" if active_run_id in self._aborted_runs else ("partial" if has_errors else "completed")
+        self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": status, "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results]})
         synthesis = await self._synthesize_results(plan=plan, results=results)
 
         worker_summary = "\n".join(
@@ -346,6 +351,47 @@ class HermesRuntime:
         if not objective:
             return f"Run {run_id} has no objective."
         return await self.delegate_parallel(objective=objective, max_workers=max_workers, run_id=run_id)
+
+    def abort_run(self, run_id: str) -> str:
+        payload = self.get_run(run_id)
+        if payload is None:
+            return f"Run not found: {run_id}"
+        current_status = str(payload.get("status", ""))
+        if current_status in {"completed", "failed", "aborted"}:
+            return f"Run {run_id} is already terminal: {current_status}"
+        self._aborted_runs.add(run_id)
+        payload["status"] = "aborted"
+        self._save_run(run_id, payload)
+        return f"Abort requested for run {run_id}"
+
+    async def retry_run(self, run_id: str, max_workers: int = 3, failed_only: bool = True) -> str:
+        payload = self.get_run(run_id)
+        if payload is None:
+            return f"Run not found: {run_id}"
+        objective = str(payload.get("objective", "")).strip()
+        if not objective:
+            return f"Run {run_id} has no objective."
+        if not failed_only:
+            return await self.delegate_parallel(objective=objective, max_workers=max_workers, run_id=run_id)
+        plan_items = payload.get("plan", [])
+        result_items = payload.get("results", [])
+        failed_ids = {int(item.get("subtask", {}).get("subtask_id")) for item in result_items if str(item.get("status")) != "ok"}
+        if not failed_ids:
+            return f"Run {run_id} has no failed subtasks to retry."
+        subtasks: list[DelegationSubtask] = []
+        for item in plan_items:
+            subtask_id = int(item.get("subtask_id", 0))
+            if subtask_id in failed_ids:
+                subtasks.append(DelegationSubtask(subtask_id=subtask_id, role=str(item.get("role", "generalist")), task=str(item.get("task", "")).strip()))
+        if not subtasks:
+            return f"Run {run_id} has no retryable failed subtasks."
+        plan = DelegationPlan(objective=objective, subtasks=subtasks)
+        self._save_run(run_id, {"run_id": run_id, "objective": objective, "status": "running", "plan": [asdict(s) for s in plan.subtasks], "results": []})
+        results = await self._execute_plan(plan=plan, max_workers=max_workers)
+        status = "partial" if any(item.status != "ok" for item in results) else "completed"
+        self._save_run(run_id, {"run_id": run_id, "objective": objective, "status": status, "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results]})
+        synthesis = await self._synthesize_results(plan=plan, results=results)
+        return f"Run ID: {run_id}\nRetried failed subtasks only.\n{synthesis}"
 
     async def _synthesize_results(self, plan: DelegationPlan, results: list[DelegationResult]) -> str:
         synth_agent = await self._make_agent(

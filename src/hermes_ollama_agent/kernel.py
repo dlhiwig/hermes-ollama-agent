@@ -89,3 +89,11 @@ class AgentKernel:
     async def resume_run(self, run_id: str, max_workers: int) -> str:
         self.events.emit("delegate.resumed", {"run_id": run_id, "workers": max_workers})
         return await self.runtime.resume_run(run_id=run_id, max_workers=max_workers)
+
+    def abort_run(self, run_id: str) -> str:
+        self.events.emit("delegate.aborted", {"run_id": run_id})
+        return self.runtime.abort_run(run_id)
+
+    async def retry_run(self, run_id: str, max_workers: int, failed_only: bool = True) -> str:
+        self.events.emit("delegate.retried", {"run_id": run_id, "workers": max_workers, "failed_only": failed_only})
+        return await self.runtime.retry_run(run_id=run_id, max_workers=max_workers, failed_only=failed_only)
