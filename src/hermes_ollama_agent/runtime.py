@@ -76,6 +76,7 @@ class DelegationResult:
     subtask: DelegationSubtask
     output: str
     status: str
+    error_kind: str | None = None
 
 
 class HermesRuntime:
@@ -232,7 +233,8 @@ class HermesRuntime:
             self._aborted_runs.remove(active_run_id)
         results = await self._execute_plan(plan=plan, max_workers=bounded_workers)
         has_errors = any(item.status != "ok" for item in results)
-        status = "aborted" if active_run_id in self._aborted_runs else ("partial" if has_errors else "completed")
+        has_success = any(item.status == "ok" for item in results)
+        status = "aborted" if active_run_id in self._aborted_runs else ("failed" if has_errors and not has_success else ("partial" if has_errors else "completed"))
         self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": status, "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results]})
         synthesis = await self._synthesize_results(plan=plan, results=results)
 
@@ -318,6 +320,7 @@ class HermesRuntime:
                 subtask=by_id[result.subtask_id],
                 output=result.output if result.error_kind is None else f"[{result.error_kind}] {result.output}",
                 status=result.status,
+                error_kind=result.error_kind,
             )
             for result in task_results
         ]
@@ -391,10 +394,36 @@ class HermesRuntime:
         plan = DelegationPlan(objective=objective, subtasks=subtasks)
         self._save_run(run_id, {"run_id": run_id, "objective": objective, "status": "running", "plan": [asdict(s) for s in plan.subtasks], "results": []})
         results = await self._execute_plan(plan=plan, max_workers=max_workers)
-        status = "partial" if any(item.status != "ok" for item in results) else "completed"
+        has_errors = any(item.status != "ok" for item in results)
+        has_success = any(item.status == "ok" for item in results)
+        status = "failed" if has_errors and not has_success else ("partial" if has_errors else "completed")
         self._save_run(run_id, {"run_id": run_id, "objective": objective, "status": status, "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results]})
         synthesis = await self._synthesize_results(plan=plan, results=results)
         return f"Run ID: {run_id}\nRetried failed subtasks only.\n{synthesis}"
+
+    @staticmethod
+    def summarize_run(payload: dict[str, Any]) -> dict[str, Any]:
+        result_items = payload.get("results", [])
+        error_counts: dict[str, int] = {}
+        ok_count = 0
+        error_count = 0
+        for item in result_items:
+            status = str(item.get("status", ""))
+            if status == "ok":
+                ok_count += 1
+                continue
+            error_count += 1
+            kind = str(item.get("error_kind") or "unknown")
+            error_counts[kind] = error_counts.get(kind, 0) + 1
+        return {
+            "run_id": payload.get("run_id"),
+            "status": payload.get("status"),
+            "objective": payload.get("objective"),
+            "ok_count": ok_count,
+            "error_count": error_count,
+            "error_counts": error_counts,
+            "subtasks": len(payload.get("plan", [])),
+        }
 
     async def _synthesize_results(self, plan: DelegationPlan, results: list[DelegationResult]) -> str:
         synth_agent = await self._make_agent(

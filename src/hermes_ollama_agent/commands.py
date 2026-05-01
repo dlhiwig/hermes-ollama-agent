@@ -128,7 +128,12 @@ class CommandRegistry:
             return "No runs."
         out = ["Recent runs:"]
         for row in rows:
-            out.append(f"- {row.get('run_id')} status={row.get('status')} objective={str(row.get('objective', ''))[:80]}")
+            summary = self.ctx.kernel.summarize_run(row)
+            out.append(
+                f"- {summary.get('run_id')} status={summary.get('status')} "
+                f"ok={summary.get('ok_count')} errors={summary.get('error_count')} "
+                f"error_kinds={summary.get('error_counts')} objective={str(summary.get('objective', ''))[:60]}"
+            )
         return "\n".join(out)
 
     async def _cmd_run(self, arg: str) -> str:
@@ -137,7 +142,8 @@ class CommandRegistry:
         row = self.ctx.kernel.get_run(arg)
         if row is None:
             return f"Run not found: {arg}"
-        return str(row)
+        summary = self.ctx.kernel.summarize_run(row)
+        return f"Summary: {summary}\nPayload: {row}"
 
     async def _cmd_resume(self, arg: str) -> str:
         if not arg:

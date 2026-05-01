@@ -99,6 +99,18 @@ class RuntimeStateTests(unittest.IsolatedAsyncioTestCase):
         assert run is not None
         self.assertEqual(run["status"], "completed")
 
+    async def test_failed_terminal_state_when_all_fail(self) -> None:
+        async def fake_exec_fail(plan: DelegationPlan, max_workers: int) -> list[DelegationResult]:
+            return [DelegationResult(plan.subtasks[0], "[timeout] fail", "error", error_kind="timeout")]
+
+        self.runtime._execute_plan = fake_exec_fail  # type: ignore[method-assign]
+        await self.runtime.delegate_parallel("all fail", max_workers=1, run_id="r-fail")
+        run = self.runtime.get_run("r-fail")
+        assert run is not None
+        self.assertEqual(run["status"], "failed")
+        summary = self.runtime.summarize_run(run)
+        self.assertEqual(summary["error_count"], 1)
+
     async def test_invalid_planner_schema_falls_back(self) -> None:
         plan = self.runtime._parse_plan('{"subtasks":[{"role":"bad","task":""}]}', "obj", 2)
         self.assertFalse(self.runtime._is_valid_plan_schema(plan, 2))
