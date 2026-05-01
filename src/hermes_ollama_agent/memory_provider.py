@@ -67,16 +67,57 @@ class ChromaMemoryProvider(MemoryProvider):
         self.chroma_dir = chroma_dir
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
         self.records_file = self.chroma_dir / "records.jsonl"
+        self._client = None
+        self._collection = None
+        try:
+            import chromadb
+
+            self._client = chromadb.PersistentClient(path=str(self.chroma_dir))
+            self._collection = self._client.get_or_create_collection(name="hermes_memory")
+        except Exception:
+            self._client = None
+            self._collection = None
 
     def add(self, record: MemoryRecord) -> None:
         line = json.dumps(asdict(record), ensure_ascii=True)
         with self.records_file.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+        if self._collection is not None:
+            try:
+                self._collection.add(
+                    ids=[record.id],
+                    documents=[record.text],
+                    metadatas=[{"timestamp": record.timestamp, "source": record.source, "role": record.role, "tags": ",".join(record.tags)}],
+                )
+            except Exception:
+                pass
 
     def search(self, query: str, top_k: int) -> list[MemoryRecord]:
         q = query.lower().strip()
         if not self.records_file.exists() or not q:
             return []
+        if self._collection is not None:
+            try:
+                out = self._collection.query(query_texts=[query], n_results=max(1, top_k))
+                ids = out.get("ids", [[]])[0]
+                docs = out.get("documents", [[]])[0]
+                metas = out.get("metadatas", [[]])[0]
+                rows: list[MemoryRecord] = []
+                for idx, doc, meta in zip(ids, docs, metas):
+                    rows.append(
+                        MemoryRecord(
+                            id=str(idx),
+                            timestamp=str(meta.get("timestamp", _ts())),
+                            source=str(meta.get("source", "vector")),
+                            role=str(meta.get("role", "system")),
+                            text=str(doc),
+                            tags=str(meta.get("tags", "")).split(",") if meta.get("tags") else [],
+                        )
+                    )
+                if rows:
+                    return rows
+            except Exception:
+                pass
         scored: list[tuple[int, MemoryRecord]] = []
         for line in self.records_file.read_text(encoding="utf-8").splitlines():
             try:

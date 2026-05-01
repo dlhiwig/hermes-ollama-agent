@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from hermes_ollama_agent.config import HermesConfig
+from hermes_ollama_agent.memory_provider import ChromaMemoryProvider, MemoryRecord
 from hermes_ollama_agent.runtime import DelegationPlan, DelegationResult, DelegationSubtask, HermesRuntime
 from hermes_ollama_agent.task_engine import TaskEngine, TaskSpec
 
@@ -129,3 +130,24 @@ class RuntimeStateTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChromaProviderTests(unittest.TestCase):
+    def test_chroma_add_and_search(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            provider = ChromaMemoryProvider(Path(tmp.name) / "chroma")
+            provider.add(
+                MemoryRecord(
+                    id="r1",
+                    timestamp="2026-01-01T00:00:00Z",
+                    source="memory_note",
+                    role="user",
+                    text="vector memory retrieval test phrase alpha",
+                    tags=["test"],
+                )
+            )
+            out = provider.search("alpha retrieval", top_k=3)
+            self.assertGreaterEqual(len(out), 1)
+        finally:
+            tmp.cleanup()

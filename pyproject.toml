@@ -9,6 +9,7 @@ description = "Hermes-inspired local agent runtime for Ollama"
 requires-python = ">=3.11"
 dependencies = [
     "agent-framework>=1.0.0a0",
+    "chromadb>=0.5.5",
 ]
 
 [project.scripts]
