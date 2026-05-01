@@ -79,3 +79,13 @@ class AgentKernel:
             {"name": event.name, "timestamp": event.timestamp, "payload": event.payload}
             for event in self.events.recent(limit)
         ]
+
+    def list_runs(self) -> list[dict[str, Any]]:
+        return self.runtime.list_runs()
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        return self.runtime.get_run(run_id)
+
+    async def resume_run(self, run_id: str, max_workers: int) -> str:
+        self.events.emit("delegate.resumed", {"run_id": run_id, "workers": max_workers})
+        return await self.runtime.resume_run(run_id=run_id, max_workers=max_workers)

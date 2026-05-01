@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
+import uuid
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import HermesConfig
 from .memory import MemoryStore
 from .prompts import build_system_prompt, build_user_turn
 from .skills import SkillLibrary
+from .task_engine import TaskEngine, TaskResult, TaskSpec
 
 ROLE_INSTRUCTIONS: dict[str, str] = {
     "researcher": (
@@ -87,8 +90,10 @@ class HermesRuntime:
         self.skills = SkillLibrary(config.skills_dir)
         self._clients: dict[str, Any] = {}
         self._agent: Any = None
+        self._runs_dir: Path = self.config.state_dir / "runs"
         self.memory.ensure()
         self.skills.load()
+        self._runs_dir.mkdir(parents=True, exist_ok=True)
 
     def _build_tools(self, allowed_tool_names: set[str]) -> list[Any]:
         from agent_framework import tool
@@ -216,11 +221,14 @@ class HermesRuntime:
         self.memory.append_turn(user_text=user_input, assistant_text=text)
         return text
 
-    async def delegate_parallel(self, objective: str, max_workers: int = 3) -> str:
+    async def delegate_parallel(self, objective: str, max_workers: int = 3, run_id: str | None = None) -> str:
         bounded_workers = max(1, min(max_workers, 6))
+        active_run_id = run_id or uuid.uuid4().hex[:12]
 
         plan = await self._build_delegation_plan(objective=objective, max_workers=bounded_workers)
+        self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": "running", "plan": [asdict(s) for s in plan.subtasks], "results": []})
         results = await self._execute_plan(plan=plan, max_workers=bounded_workers)
+        self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": "completed", "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results]})
         synthesis = await self._synthesize_results(plan=plan, results=results)
 
         worker_summary = "\n".join(
@@ -237,7 +245,7 @@ class HermesRuntime:
             user_text=f"[delegated] {objective}",
             assistant_text=composed,
         )
-        return composed
+        return f"Run ID: {active_run_id}\n{composed}"
 
     async def _build_delegation_plan(self, objective: str, max_workers: int) -> DelegationPlan:
         planner_prompt = (
@@ -270,39 +278,74 @@ class HermesRuntime:
         return self._fallback_plan(objective=objective, max_workers=max_workers)
 
     async def _execute_plan(self, plan: DelegationPlan, max_workers: int) -> list[DelegationResult]:
-        semaphore = asyncio.Semaphore(max_workers)
-
-        async def run_subtask(subtask: DelegationSubtask) -> DelegationResult:
-            async with semaphore:
-                role_instructions = ROLE_INSTRUCTIONS.get(subtask.role, ROLE_INSTRUCTIONS["generalist"])
+        engine = TaskEngine(max_workers=max_workers, timeout_s=90.0, retries=1)
+        specs: list[TaskSpec] = []
+        for subtask in plan.subtasks:
+            async def run_for_subtask(s: DelegationSubtask = subtask) -> str:
+                role_instructions = ROLE_INSTRUCTIONS.get(s.role, ROLE_INSTRUCTIONS["generalist"])
                 worker_agent = await self._make_agent(
-                    name=f"{subtask.role.title()}Worker{subtask.subtask_id}",
+                    name=f"{s.role.title()}Worker{s.subtask_id}",
                     instructions=(
                         f"{role_instructions}\n"
                         "You are one worker in a parallel delegation pipeline. "
                         "Be explicit about assumptions and hand-off details."
                     ),
-                    model_role=subtask.role,
-                    policy_role=subtask.role,
+                    model_role=s.role,
+                    policy_role=s.role,
                 )
                 worker_prompt = (
                     f"Top-level objective:\n{plan.objective}\n\n"
-                    f"Assigned subtask ({subtask.role}):\n{subtask.task}\n\n"
+                    f"Assigned subtask ({s.role}):\n{s.task}\n\n"
                     "Deliver output with headings:\n"
                     "1) Findings\n2) Proposed Actions\n3) Hand-off Notes\n"
                 )
-                try:
-                    output = self._extract_text(await worker_agent.run(worker_prompt))
-                    return DelegationResult(subtask=subtask, output=output, status="ok")
-                except Exception as exc:  # pragma: no cover - runtime integration path
-                    return DelegationResult(
-                        subtask=subtask,
-                        output=f"Worker execution failed: {exc}",
-                        status="error",
-                    )
+                return self._extract_text(await worker_agent.run(worker_prompt))
 
-        tasks = [run_subtask(item) for item in plan.subtasks]
-        return await asyncio.gather(*tasks)
+            specs.append(TaskSpec(subtask.subtask_id, subtask.role, subtask.task, run_for_subtask))
+
+        task_results: list[TaskResult] = await engine.execute(specs)
+        by_id = {s.subtask_id: s for s in plan.subtasks}
+        return [
+            DelegationResult(
+                subtask=by_id[result.subtask_id],
+                output=result.output if result.error_kind is None else f"[{result.error_kind}] {result.output}",
+                status=result.status,
+            )
+            for result in task_results
+        ]
+
+    def _save_run(self, run_id: str, payload: dict[str, Any]) -> None:
+        target = self._runs_dir / f"{run_id}.json"
+        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def list_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for path in sorted(self._runs_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]:
+            try:
+                rows.append(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+        return rows
+
+    def get_run(self, run_id: str) -> dict[str, Any] | None:
+        path = self._runs_dir / f"{run_id}.json"
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    async def resume_run(self, run_id: str, max_workers: int = 3) -> str:
+        payload = self.get_run(run_id)
+        if payload is None:
+            return f"Run not found: {run_id}"
+        if payload.get("status") == "completed":
+            return f"Run {run_id} is already completed."
+        objective = str(payload.get("objective", "")).strip()
+        if not objective:
+            return f"Run {run_id} has no objective."
+        return await self.delegate_parallel(objective=objective, max_workers=max_workers, run_id=run_id)
 
     async def _synthesize_results(self, plan: DelegationPlan, results: list[DelegationResult]) -> str:
         synth_agent = await self._make_agent(

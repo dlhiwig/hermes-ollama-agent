@@ -31,6 +31,9 @@ class CommandRegistry:
             "/health": self._cmd_health,
             "/status": self._cmd_status,
             "/events": self._cmd_events,
+            "/runs": self._cmd_runs,
+            "/run": self._cmd_run,
+            "/resume": self._cmd_resume,
         }
 
     def has_command(self, text: str) -> bool:
@@ -53,6 +56,7 @@ class CommandRegistry:
             "  /search <query>\n  /delegate <objective>\n  /reload\n"
             "  /memory\n  /remember <note>\n  /prefer <note>\n"
             "  /health\n  /status\n  /events"
+            "\n  /runs\n  /run <id>\n  /resume <id>"
         )
 
     async def _cmd_routing(self, _: str) -> str:
@@ -115,3 +119,25 @@ class CommandRegistry:
         for item in rows:
             formatted.append(f"- {item['timestamp']} {item['name']} {item['payload']}")
         return "\n".join(formatted)
+
+    async def _cmd_runs(self, _: str) -> str:
+        rows = self.ctx.kernel.list_runs()
+        if not rows:
+            return "No runs."
+        out = ["Recent runs:"]
+        for row in rows:
+            out.append(f"- {row.get('run_id')} status={row.get('status')} objective={str(row.get('objective', ''))[:80]}")
+        return "\n".join(out)
+
+    async def _cmd_run(self, arg: str) -> str:
+        if not arg:
+            return "Usage: /run <id>"
+        row = self.ctx.kernel.get_run(arg)
+        if row is None:
+            return f"Run not found: {arg}"
+        return str(row)
+
+    async def _cmd_resume(self, arg: str) -> str:
+        if not arg:
+            return "Usage: /resume <id>"
+        return await self.ctx.kernel.resume_run(arg, self.ctx.delegate_workers)
