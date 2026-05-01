@@ -224,7 +224,7 @@ class HermesRuntime:
         synthesis = await self._synthesize_results(plan=plan, results=results)
 
         worker_summary = "\n".join(
-            f"{item.subtask.subtask_id}. [{item.subtask.role}] {item.subtask.task}"
+            f"{item.subtask_id}. [{item.role}] {item.task}"
             for item in plan.subtasks
         )
         composed = (

@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 
+from .commands import CommandContext, CommandRegistry
 from .config import HermesConfig
+from .kernel import AgentKernel
 from .runtime import HermesRuntime
 
 HELP_TEXT = """Commands:
@@ -18,6 +20,9 @@ HELP_TEXT = """Commands:
   /memory                Show current memory context
   /remember <note>       Append note to MEMORY.md
   /prefer <note>         Append note to USER.md
+  /health                Run health checks
+  /status                Show kernel status
+  /events                Show recent lifecycle events
 """
 
 
@@ -79,6 +84,9 @@ def _apply_overrides(cfg: HermesConfig, args: argparse.Namespace) -> HermesConfi
 async def run_repl(args: argparse.Namespace) -> None:
     cfg = _apply_overrides(HermesConfig.from_env(), args)
     runtime = HermesRuntime(cfg)
+    kernel = AgentKernel(runtime)
+    await kernel.initialize()
+    commands = CommandRegistry(CommandContext(kernel=kernel, delegate_workers=args.delegate_workers))
 
     print(f"Model: {cfg.model_id}")
     print(f"Base URL: {cfg.base_url}")
@@ -101,51 +109,19 @@ async def run_repl(args: argparse.Namespace) -> None:
         if user_input == "/help":
             print(HELP_TEXT)
             continue
-        if user_input == "/routing":
-            print(runtime.describe_routing())
-            continue
-        if user_input == "/skills":
-            print(runtime.list_skills())
-            continue
-        if user_input.startswith("/skill "):
-            print(runtime.read_skill(user_input[7:].strip()))
-            continue
-        if user_input.startswith("/search "):
-            print(runtime.search_skills(user_input[8:].strip()))
-            continue
-        if user_input.startswith("/delegate "):
-            objective = user_input[10:].strip()
-            if not objective:
-                print("Usage: /delegate <objective>")
-                continue
+        if commands.has_command(user_input):
             try:
-                delegated = await runtime.delegate_parallel(
-                    objective=objective,
-                    max_workers=args.delegate_workers,
-                )
+                result = await commands.execute(user_input)
             except Exception as exc:  # pragma: no cover - runtime integration path
-                print(f"Delegation error: {exc}")
+                print(f"Command error: {exc}")
                 continue
-            print(f"hermes-delegate> {delegated}\n")
-            continue
-        if user_input == "/reload":
-            runtime.reload_skills()
-            print("Reloaded skills.")
-            continue
-        if user_input == "/memory":
-            print(runtime.get_memory())
-            continue
-        if user_input.startswith("/remember "):
-            runtime.add_memory(user_input[10:].strip())
-            print("Saved to MEMORY.md")
-            continue
-        if user_input.startswith("/prefer "):
-            runtime.add_user_pref(user_input[8:].strip())
-            print("Saved to USER.md")
+            if result:
+                prefix = "hermes-delegate" if user_input.startswith("/delegate") else "hermes"
+                print(f"{prefix}> {result}\n")
             continue
 
         try:
-            response = await runtime.run_turn(user_input)
+            response = await kernel.chat_turn(user_input)
         except ImportError as exc:
             raise RuntimeError(
                 "Missing dependency. Install with: pip install -e ."
@@ -155,6 +131,7 @@ async def run_repl(args: argparse.Namespace) -> None:
             continue
 
         print(f"hermes> {response}\n")
+    await kernel.shutdown()
 
 
 def main() -> None:
