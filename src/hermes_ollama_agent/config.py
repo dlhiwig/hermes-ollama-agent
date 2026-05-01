@@ -22,6 +22,11 @@ class HermesConfig:
     memory_char_budget: int = 6000
     user_char_budget: int = 3000
     max_turn_chars: int = 1200
+    memory_backend: str = "markdown"
+    chroma_dir: Path = Path(".hermes/chroma")
+    memory_top_k: int = 5
+    web_max_requests: int = 5
+    exec_timeout_s: int = 30
 
     @classmethod
     def from_env(cls) -> "HermesConfig":
@@ -47,6 +52,11 @@ class HermesConfig:
             memory_char_budget=int(os.getenv("HERMES_MEMORY_BUDGET", "6000")),
             user_char_budget=int(os.getenv("HERMES_USER_BUDGET", "3000")),
             max_turn_chars=int(os.getenv("HERMES_TURN_BUDGET", "1200")),
+            memory_backend=os.getenv("HERMES_MEMORY_BACKEND", "markdown"),
+            chroma_dir=Path(os.getenv("HERMES_CHROMA_DIR", ".hermes/chroma")),
+            memory_top_k=int(os.getenv("HERMES_MEMORY_TOP_K", "5")),
+            web_max_requests=int(os.getenv("HERMES_WEB_MAX_REQUESTS", "5")),
+            exec_timeout_s=int(os.getenv("HERMES_EXEC_TIMEOUT_S", "30")),
         )
 
     def model_for_role(self, role: str) -> str:

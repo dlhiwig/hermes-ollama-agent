@@ -100,3 +100,9 @@ class AgentKernel:
     async def retry_run(self, run_id: str, max_workers: int, failed_only: bool = True) -> str:
         self.events.emit("delegate.retried", {"run_id": run_id, "workers": max_workers, "failed_only": failed_only})
         return await self.runtime.retry_run(run_id=run_id, max_workers=max_workers, failed_only=failed_only)
+
+    def memory_search(self, query: str, top_k: int = 5) -> str:
+        return self.runtime.memory_search(query, top_k)
+
+    def routing_explain(self, text: str) -> str:
+        return self.runtime.routing_explain(text)

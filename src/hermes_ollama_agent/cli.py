@@ -28,6 +28,9 @@ HELP_TEXT = """Commands:
   /resume <id>           Resume a non-completed run
   /abort <id>            Mark a run aborted
   /retry <id>            Retry failed subtasks from a run
+  /memory-search <query> Search memory backend
+  /run-sources <id>      Show persisted web sources for a run
+  /routing-explain <t>   Explain dynamic routing decision for text
 """
 
 

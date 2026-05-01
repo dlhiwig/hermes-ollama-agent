@@ -4,14 +4,19 @@ import asyncio
 import json
 import uuid
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .config import HermesConfig
+from .code_exec import SandboxedExecutor
+from .memory_provider import ChromaMemoryProvider, MarkdownMemoryProvider, MemoryRecord
 from .memory import MemoryStore
 from .prompts import build_system_prompt, build_user_turn
+from .routing_policy import RoutingPolicyEngine
 from .skills import SkillLibrary
 from .task_engine import TaskEngine, TaskResult, TaskSpec
+from .web_tools import WebResearchTools
 
 ROLE_INSTRUCTIONS: dict[str, str] = {
     "researcher": (
@@ -55,6 +60,11 @@ TOOL_ORDER: list[str] = [
     "read_memory_snapshot",
     "add_memory",
     "add_user_preference",
+    "memory_search",
+    "web_search",
+    "web_fetch",
+    "web_cite",
+    "code_exec",
 ]
 
 
@@ -96,6 +106,17 @@ class HermesRuntime:
         self.skills.load()
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._aborted_runs: set[str] = set()
+        self.routing_policy = RoutingPolicyEngine()
+        self.web_tools = WebResearchTools(max_requests=self.config.web_max_requests)
+        self.exec_runner = SandboxedExecutor(
+            allowed_prefixes=["python", "pytest", "pwsh", "powershell"],
+            cwd_allowlist=[Path(".").resolve(), self.config.state_dir.resolve()],
+            timeout_s=self.config.exec_timeout_s,
+        )
+        if self.config.memory_backend == "chroma":
+            self.memory_provider = ChromaMemoryProvider(self.config.chroma_dir)
+        else:
+            self.memory_provider = MarkdownMemoryProvider(self.memory)
 
     def _build_tools(self, allowed_tool_names: set[str]) -> list[Any]:
         from agent_framework import tool
@@ -137,6 +158,25 @@ class HermesRuntime:
             """Persist a user preference note."""
             self.memory.add_user_note(note)
             return "Saved note to USER.md"
+        @tool(approval_mode="never_require")
+        def memory_search(query: str, top_k: int = 5) -> str:
+            rows = self.memory_provider.search(query, max(1, min(top_k, 20)))
+            if not rows:
+                return "No memory matches."
+            return "\n".join(f"- [{r.source}/{r.role}] {r.text[:200]}" for r in rows)
+        @tool(approval_mode="never_require")
+        def web_search(query: str, limit: int = 3) -> str:
+            return self.web_tools.search(query, limit=limit)
+        @tool(approval_mode="never_require")
+        def web_fetch(url: str) -> str:
+            return self.web_tools.fetch(url)
+        @tool(approval_mode="never_require")
+        def web_cite() -> str:
+            return json.dumps(self.web_tools.cite())
+        @tool(approval_mode="never_require")
+        def code_exec(command: str, cwd: str = ".") -> str:
+            result = self.exec_runner.run(command, Path(cwd).resolve())
+            return json.dumps(result)
 
         registry: dict[str, Any] = {
             "list_skills": list_skills,
@@ -145,6 +185,11 @@ class HermesRuntime:
             "read_memory_snapshot": read_memory_snapshot,
             "add_memory": add_memory,
             "add_user_preference": add_user_preference,
+            "memory_search": memory_search,
+            "web_search": web_search,
+            "web_fetch": web_fetch,
+            "web_cite": web_cite,
+            "code_exec": code_exec,
         }
         return [registry[name] for name in TOOL_ORDER if name in allowed_tool_names]
 
@@ -221,21 +266,27 @@ class HermesRuntime:
         response = await self._agent.run(prompt)
         text = self._extract_text(response)
         self.memory.append_turn(user_text=user_input, assistant_text=text)
+        self.memory_provider.add(MemoryRecord(id=uuid.uuid4().hex[:12], timestamp=datetime.now(timezone.utc).isoformat(), source="turn", role="assistant", text=text, tags=["chat"]))
         return text
 
     async def delegate_parallel(self, objective: str, max_workers: int = 3, run_id: str | None = None) -> str:
         bounded_workers = max(1, min(max_workers, 6))
         active_run_id = run_id or uuid.uuid4().hex[:12]
 
+        routing_decision = self.routing_policy.decide(objective, self.list_runs(limit=10))
+        bounded_workers = min(bounded_workers, int(routing_decision.get("worker_cap", bounded_workers)))
         plan = await self._build_delegation_plan(objective=objective, max_workers=bounded_workers)
-        self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": "running", "plan": [asdict(s) for s in plan.subtasks], "results": []})
+        self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": "running", "plan": [asdict(s) for s in plan.subtasks], "results": [], "attempts": [], "sources": [], "exec_artifacts": [], "routing_decision": routing_decision})
         if active_run_id in self._aborted_runs:
             self._aborted_runs.remove(active_run_id)
         results = await self._execute_plan(plan=plan, max_workers=bounded_workers)
         has_errors = any(item.status != "ok" for item in results)
         has_success = any(item.status == "ok" for item in results)
         status = "aborted" if active_run_id in self._aborted_runs else ("failed" if has_errors and not has_success else ("partial" if has_errors else "completed"))
-        self._save_run(active_run_id, {"run_id": active_run_id, "objective": objective, "status": status, "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results]})
+        payload = self.get_run(active_run_id) or {"run_id": active_run_id, "objective": objective, "attempts": []}
+        payload.update({"status": status, "plan": [asdict(s) for s in plan.subtasks], "results": [asdict(r) for r in results], "sources": self.web_tools.cite()})
+        payload["attempts"] = payload.get("attempts", []) + [{"status": status, "results": [asdict(r) for r in results]}]
+        self._save_run(active_run_id, payload)
         synthesis = await self._synthesize_results(plan=plan, results=results)
 
         worker_summary = "\n".join(
@@ -579,7 +630,16 @@ class HermesRuntime:
         return "\n".join(f"- {doc.name}: {doc.preview}" for doc in docs)
 
     def get_memory(self) -> str:
-        return self.memory.context_block()
+        return self.memory_provider.snapshot()
+
+    def memory_search(self, query: str, top_k: int = 5) -> str:
+        rows = self.memory_provider.search(query, top_k)
+        if not rows:
+            return "No memory matches."
+        return "\n".join(f"- [{r.source}/{r.role}] {r.text[:200]}" for r in rows)
+
+    def routing_explain(self, text: str) -> str:
+        return str(self.routing_policy.decide(text, self.list_runs(limit=10)))
 
     def add_memory(self, note: str) -> None:
         self.memory.add_memory_note(note)

@@ -36,6 +36,9 @@ class CommandRegistry:
             "/resume": self._cmd_resume,
             "/abort": self._cmd_abort,
             "/retry": self._cmd_retry,
+            "/memory-search": self._cmd_memory_search,
+            "/run-sources": self._cmd_run_sources,
+            "/routing-explain": self._cmd_routing_explain,
         }
 
     def has_command(self, text: str) -> bool:
@@ -59,6 +62,7 @@ class CommandRegistry:
             "  /memory\n  /remember <note>\n  /prefer <note>\n"
             "  /health\n  /status\n  /events"
             "\n  /runs\n  /run <id>\n  /resume <id>\n  /abort <id>\n  /retry <id>"
+            "\n  /memory-search <query>\n  /run-sources <id>\n  /routing-explain <text>"
         )
 
     async def _cmd_routing(self, _: str) -> str:
@@ -159,3 +163,21 @@ class CommandRegistry:
         if not arg:
             return "Usage: /retry <id>"
         return await self.ctx.kernel.retry_run(arg, self.ctx.delegate_workers, failed_only=True)
+
+    async def _cmd_memory_search(self, arg: str) -> str:
+        if not arg:
+            return "Usage: /memory-search <query>"
+        return self.ctx.kernel.memory_search(arg, top_k=5)
+
+    async def _cmd_run_sources(self, arg: str) -> str:
+        if not arg:
+            return "Usage: /run-sources <id>"
+        row = self.ctx.kernel.get_run(arg)
+        if row is None:
+            return f"Run not found: {arg}"
+        return str(row.get("sources", []))
+
+    async def _cmd_routing_explain(self, arg: str) -> str:
+        if not arg:
+            return "Usage: /routing-explain <text>"
+        return self.ctx.kernel.routing_explain(arg)
