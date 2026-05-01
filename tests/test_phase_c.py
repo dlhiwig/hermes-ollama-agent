@@ -99,6 +99,21 @@ class RuntimeStateTests(unittest.IsolatedAsyncioTestCase):
         assert run is not None
         self.assertEqual(run["status"], "completed")
 
+    async def test_invalid_planner_schema_falls_back(self) -> None:
+        plan = self.runtime._parse_plan('{"subtasks":[{"role":"bad","task":""}]}', "obj", 2)
+        self.assertFalse(self.runtime._is_valid_plan_schema(plan, 2))
+        fallback = self.runtime._fallback_plan("obj", 2)
+        self.assertTrue(self.runtime._is_valid_plan_schema(fallback, 2))
+
+    async def test_low_signal_detection(self) -> None:
+        self.assertTrue(self.runtime._is_low_signal_output("ok"))
+        self.assertTrue(self.runtime._is_low_signal_output("I cannot proceed without more info."))
+        self.assertFalse(
+            self.runtime._is_low_signal_output(
+                "Findings: constraints captured. Proposed actions: implement, test, and validate with clear handoff notes."
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

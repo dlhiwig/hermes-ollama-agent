@@ -278,7 +278,7 @@ class HermesRuntime:
         )
         raw_plan = self._extract_text(await planner_agent.run(planner_prompt))
         parsed = self._parse_plan(raw_plan, objective=objective, max_workers=max_workers)
-        if parsed.subtasks:
+        if parsed.subtasks and self._is_valid_plan_schema(parsed, max_workers=max_workers):
             return parsed
         return self._fallback_plan(objective=objective, max_workers=max_workers)
 
@@ -304,7 +304,10 @@ class HermesRuntime:
                     "Deliver output with headings:\n"
                     "1) Findings\n2) Proposed Actions\n3) Hand-off Notes\n"
                 )
-                return self._extract_text(await worker_agent.run(worker_prompt))
+                output = self._extract_text(await worker_agent.run(worker_prompt))
+                if self._is_low_signal_output(output):
+                    raise ValueError("low-signal worker output")
+                return output
 
             specs.append(TaskSpec(subtask.subtask_id, subtask.role, subtask.task, run_for_subtask))
 
@@ -453,6 +456,38 @@ class HermesRuntime:
             )
 
         return DelegationPlan(objective=objective, subtasks=subtasks)
+
+    def _is_valid_plan_schema(self, plan: DelegationPlan, max_workers: int) -> bool:
+        if not plan.subtasks:
+            return False
+        if len(plan.subtasks) > max_workers:
+            return False
+        seen_ids: set[int] = set()
+        for item in plan.subtasks:
+            if item.subtask_id in seen_ids:
+                return False
+            seen_ids.add(item.subtask_id)
+            if item.role not in ROLE_INSTRUCTIONS:
+                return False
+            if not item.task.strip():
+                return False
+        return True
+
+    @staticmethod
+    def _is_low_signal_output(text: str) -> bool:
+        stripped = text.strip()
+        if len(stripped) < 60:
+            return True
+        lowered = stripped.lower()
+        weak_markers = [
+            "i can't",
+            "i cannot",
+            "not enough information",
+            "as an ai",
+            "unable to",
+            "no skills loaded",
+        ]
+        return any(marker in lowered for marker in weak_markers)
 
     @staticmethod
     def _extract_json(text: str) -> str | None:
